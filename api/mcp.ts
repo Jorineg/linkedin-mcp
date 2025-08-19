@@ -4,7 +4,7 @@ import LinkedInPkg from 'linkedin-private-api';
 
 export const config = { runtime: 'nodejs' };
 
-type BearerAuth = { username: string; password: string };
+type BearerAuth = { username?: string; password?: string; cookies?: any };
 type McpRequest =
     | { type: 'list_tools' }
     | { type: 'call_tool'; name: 'search_accounts'; params: { query: string; limit?: number } }
@@ -47,11 +47,37 @@ const parseBearer = (req: IncomingMessage): BearerAuth => {
     const auth = req.headers['authorization'] as string | undefined;
     if (!auth || !auth.startsWith('Bearer ')) throw new Error('Missing Bearer auth');
     const token = auth.slice('Bearer '.length).trim();
-    let creds: any;
-    try { creds = JSON.parse(token); } catch { throw new Error('Bearer must be JSON {"username","password"}'); }
-    if (!creds?.username || !creds?.password) throw new Error('Bearer JSON must include username and password');
-    return { username: String(creds.username), password: String(creds.password) };
+    const tryParse = (s: string) => { try { return JSON.parse(s); } catch { return null; } };
+    let creds: any = tryParse(token);
+    if (!creds) {
+        // Try base64 (including base64url) decode
+        try {
+            const normalized = token.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(token.length / 4) * 4, '=');
+            const decoded = Buffer.from(normalized, 'base64').toString('utf8');
+            creds = tryParse(decoded);
+        } catch { /* ignore */ }
+    }
+    if (!creds) throw new Error('Bearer must be JSON or base64(JSON)');
+    const result: BearerAuth = {};
+    if (creds?.username) result.username = String(creds.username);
+    if (creds?.password) result.password = String(creds.password);
+    if (creds?.cookies) result.cookies = creds.cookies;
+    if (!result.cookies && !(result.username && result.password)) throw new Error('Bearer must include cookies or username/password');
+    return result;
 };
+
+function getAuthFromEnv(): BearerAuth | null {
+    const cookiesJson = process.env.LI_COOKIES;
+    const envUsername = process.env.LI_USERNAME as string | undefined;
+    const envPassword = process.env.LI_PASSWORD as string | undefined;
+    if (cookiesJson) {
+        return { username: envUsername, cookies: cookiesJson };
+    }
+    if (envUsername && envPassword) {
+        return { username: envUsername, password: envPassword };
+    }
+    return null;
+}
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
@@ -72,11 +98,21 @@ async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 async function loginClient(auth: BearerAuth): Promise<any> {
-    try { await fs.unlink('sessions.json'); } catch { }
+    if (process.env.LI_RESET === '1') { try { await fs.unlink('sessions.json'); } catch { } }
     const ClientCtor = (LinkedInPkg as any).Client;
     const client = new ClientCtor();
-    await client.login.userPass({ username: auth.username, password: auth.password, useCache: false });
-    return client;
+    const providedCookies = auth.cookies;
+    if (providedCookies) {
+        const cookiesArr = Array.isArray(providedCookies) ? providedCookies : JSON.parse(String(providedCookies));
+        const username = auth.username || process.env.LI_USERNAME || '';
+        await client.login.userCookie({ username, cookies: cookiesArr, useCache: true });
+        return client;
+    }
+    if (auth.username && auth.password) {
+        await client.login.userPass({ username: auth.username, password: auth.password, useCache: true });
+        return client;
+    }
+    throw new Error('No valid auth provided');
 }
 
 function normalizeDate(obj: any): string | undefined {
@@ -161,7 +197,8 @@ async function getProfile(client: any, publicIdentifier: string): Promise<Profil
 export default async function handler(req: any, res: any) {
     try {
         if (req.method !== 'POST' || (req.url || '') !== '/api/mcp') { return json(res, 404, { error: 'Not Found' }); }
-        let auth: BearerAuth; try { auth = parseBearer(req); } catch (e: any) { return json(res, 401, { error: e?.message || 'Unauthorized' }); }
+        let auth: BearerAuth | null = null;
+        try { auth = parseBearer(req); } catch (e: any) { auth = getAuthFromEnv(); if (!auth) return json(res, 401, { error: e?.message || 'Unauthorized' }); }
         const body = await parseBody(req) as McpRequest; if (!body || typeof body !== 'object') return json(res, 400, { error: 'Invalid JSON body' });
 
         if (body.type === 'list_tools') {
@@ -182,7 +219,7 @@ export default async function handler(req: any, res: any) {
                 const publicIdentifier = body.params?.publicIdentifier; if (!publicIdentifier) return json(res, 400, { error: 'publicIdentifier is required' });
                 await sleep(500); const result = await getProfile(client, publicIdentifier); return json(res, 200, { result });
             }
-            return json(res, 400, { error: `Unknown tool ${body.name}` });
+            return json(res, 400, { error: 'Unknown tool' });
         }
 
         return json(res, 400, { error: 'Unsupported request' });

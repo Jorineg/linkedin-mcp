@@ -1,14 +1,9 @@
 {
     "version": 2,
-    "functions": {
-        "api/mcp.ts": {
-            "runtime": "nodejs18.x"
-        }
-    },
-    "routes": [
+    "rewrites": [
         {
-            "src": "/mcp",
-            "dest": "/api/mcp"
+            "source": "/mcp",
+            "destination": "/api/mcp"
         }
     ]
 }

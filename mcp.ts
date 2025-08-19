@@ -39,6 +39,9 @@ type ProfileResult = {
     skills: string[];
 };
 
+// Toggle whether to advertise the search tool in list_tools (implementation remains)
+const ADVERTISE_SEARCH = false;
+
 const json = (res: ServerResponse, status: number, data: unknown) => {
     res.statusCode = status;
     res.setHeader('Content-Type', 'application/json');
@@ -229,20 +232,20 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
         }
 
         if (body.type === 'list_tools') {
-            json(res, 200, {
-                tools: [
-                    {
-                        name: 'search_accounts',
-                        description: 'Search LinkedIn people by keywords and return first page of results',
-                        parameters: { query: 'string', limit: 'number (optional, default 10)' }
-                    },
-                    {
-                        name: 'get_profile',
-                        description: 'Fetch a LinkedIn profile by publicIdentifier and return summary, experience, education and skills',
-                        parameters: { publicIdentifier: 'string' }
-                    }
-                ]
+            const tools: any[] = [];
+            if (ADVERTISE_SEARCH) {
+                tools.push({
+                    name: 'search_accounts',
+                    description: 'Search LinkedIn people by keywords and return first page of results',
+                    parameters: { query: 'string', limit: 'number (optional, default 10)' }
+                });
+            }
+            tools.push({
+                name: 'get_profile',
+                description: 'Fetch a LinkedIn profile by publicIdentifier and return summary, experience, education and skills',
+                parameters: { publicIdentifier: 'string' }
             });
+            json(res, 200, { tools });
             return;
         }
 
@@ -252,8 +255,14 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
                 if (body.name === 'search_accounts') {
                     const q = body.params?.query || '';
                     const limit = Math.min(Math.max(Number(body.params?.limit ?? 10), 1), 25);
-                    const results = await searchAccounts(client, q, limit);
-                    json(res, 200, { results });
+                    try {
+                        const results = await searchAccounts(client, q, limit);
+                        json(res, 200, { results });
+                    } catch (e: any) {
+                        const status = e?.response?.status;
+                        const note = status ? `search denied by LinkedIn (status ${status})` : 'search failed';
+                        json(res, 200, { results: [], note });
+                    }
                     return;
                 }
                 if (body.name === 'get_profile') {

@@ -8,6 +8,8 @@ const SERVER_URL = process.env.MCP_URL || 'http://localhost:3000/mcp';
 function callMcp(body: any, bearerJson: any): Promise<any> {
     return new Promise((resolve, reject) => {
         const url = new URL(SERVER_URL);
+        const bearerJsonString = JSON.stringify(bearerJson);
+        console.log('Bearer:', bearerJsonString);
         const req = http.request({
             method: 'POST',
             hostname: url.hostname,
@@ -15,7 +17,7 @@ function callMcp(body: any, bearerJson: any): Promise<any> {
             path: url.pathname,
             headers: {
                 'Content-Type': 'application/json',
-                'Authorization': `Bearer ${JSON.stringify(bearerJson)}`,
+                'Authorization': `Bearer ${bearerJsonString}`,
             },
         }, (res) => {
             const chunks: Buffer[] = [];

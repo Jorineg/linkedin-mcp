@@ -3,7 +3,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "tsx api.ts"
+    "start": "tsx api.ts",
+    "dev:mcp": "tsx mcp.ts",
+    "test:mcp": "tsx test_mcp.ts"
   },
   "dependencies": {
     "dotenv": "^17.2.1",

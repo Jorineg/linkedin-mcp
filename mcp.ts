@@ -100,6 +100,13 @@ function getAuthFromEnv(): BearerAuth | null {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+function dbg(...args: any[]) {
+    if (process.env.LI_DEBUG === '1' || process.env.LI_DEBUG_SEARCH === '1') {
+        // eslint-disable-next-line no-console
+        console.log('[LI]', ...args);
+    }
+}
+
 function serializeCookieHeader(arr: any[]): string {
     const parts: string[] = [];
     for (const c of arr) {
@@ -162,25 +169,37 @@ function authCookiesFromBearer(auth: BearerAuth): any[] {
     });
 }
 
-async function manualGet<T = any>(auth: BearerAuth, path: string, referer: string): Promise<T> {
+async function manualGet<T = any>(auth: BearerAuth, path: string, referer: string, label?: string): Promise<T> {
     const cookiesArr = authCookiesFromBearer(auth);
     const js = cookiesArr.find((c: any) => String(c?.name).toUpperCase() === 'JSESSIONID');
     const jsValue = String(js?.value || '');
     const cookieHeader = serializeCookieHeader(cookiesArr);
+    const langCookie = cookiesArr.find((c: any) => String(c?.name) === 'lang');
+    const langValue: string | undefined = typeof langCookie?.value === 'string' ? langCookie.value : undefined;
+    const langParam = langValue && /lang=([a-z-]+)/i.test(langValue) ? /lang=([a-z-]+)/i.exec(langValue)![1] : undefined;
+    const xLiLang = langParam ? langParam.replace('-', '_') : 'en_US';
     const headers: Record<string, string> = {
         'user-agent': process.env.LI_UA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
         'accept': 'application/vnd.linkedin.normalized+json+2.1',
         'x-restli-protocol-version': '2.0.0',
         'referer': referer,
         'cookie': cookieHeader,
+        'accept-language': 'en-US,en;q=0.9',
+        'x-li-lang': xLiLang,
+        'x-li-track': '{"clientVersion":"1.11.*","osName":"web","osVersion":"unknown","deviceFormFactor":"DESKTOP","mpName":"voyager-web"}',
     };
-    if (jsValue) headers['csrf-token'] = jsValue;
+    if (jsValue) headers['csrf-token'] = jsValue.startsWith('ajax:') ? jsValue : `ajax:${jsValue}`;
     return await new Promise((resolve, reject) => {
         const req = https.request({ method: 'GET', hostname: 'www.linkedin.com', path, headers }, (res) => {
             const chunks: Buffer[] = [];
             res.on('data', (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
             res.on('end', () => {
                 const raw = Buffer.concat(chunks).toString('utf8');
+                if (process.env.LI_DEBUG === '1' || process.env.LI_DEBUG_SEARCH === '1') {
+                    dbg((label || 'GET'), path, 'status', res.statusCode, 'bytes', raw.length);
+                    const preview = raw.slice(0, 200).replace(/\s+/g, ' ');
+                    dbg('preview:', preview);
+                }
                 try { resolve(JSON.parse(raw)); } catch (e) { reject(new Error(`Non-JSON response (${res.statusCode}): ${raw.slice(0, 200)}`)); }
             });
         });
@@ -257,43 +276,87 @@ function parseVoyagerProfile(raw: any): ProfileResult {
 }
 
 async function manualSearchPeopleRaw(auth: BearerAuth, query: string, limit = 10): Promise<any> {
-    const q = encodeURIComponent(query);
-    const start = 0;
+    const qStr = String(query || '');
     const count = Math.min(Math.max(limit, 1), 25);
-    const filters = encodeURIComponent('List(resultType->PEOPLE)');
-    const path = `/voyager/api/search/people?keywords=${q}&origin=GLOBAL_SEARCH_HEADER&q=all&filters=${filters}&count=${count}&start=${start}`;
-    const referer = `https://www.linkedin.com/search/results/people/?keywords=${q}`;
-    return await manualGet(auth, path, referer);
+    const params = new URLSearchParams({
+        count: String(count),
+        filters: 'List(resultType->PEOPLE)',
+        origin: 'GLOBAL_SEARCH_HEADER',
+        q: 'all',
+        start: '0',
+        queryContext: 'List(spellCorrectionEnabled->true,relatedSearchesEnabled->true,kcardTypes->PROFILE|COMPANY)'
+    });
+    if (qStr) params.set('keywords', qStr);
+    const path = `/voyager/api/search/blended?${params.toString()}`;
+    const qEnc = encodeURIComponent(qStr);
+    const referer = `https://www.linkedin.com/search/results/people/?keywords=${qEnc}`;
+    dbg('search blended (py) request');
+    const blended = await manualGet(auth, path, referer, 'search-blended-py');
+    return blended;
 }
 
 function parsePeopleFromBlended(raw: any): SearchAccountResult[] {
-    const included: any[] = Array.isArray(raw?.included) ? raw.included : [];
-    const byType: Record<string, any[]> = {};
-    for (const item of included) {
-        const t = String(item?.$type || 'unknown');
-        (byType[t] ||= []).push(item);
-    }
-    const isType = (s: string, needle: string) => s.toLowerCase().includes(needle);
-    const miniProfiles = Object.entries(byType)
-        .filter(([t]) => isType(t, 'miniprofile'))
-        .flatMap(([, arr]) => arr);
     const results: SearchAccountResult[] = [];
-    for (const mp of miniProfiles) {
-        const first = mp?.firstName || '';
-        const last = mp?.lastName || '';
-        const fullName = `${first} ${last}`.trim();
-        const publicIdentifier = mp?.publicIdentifier || '';
-        const headline = mp?.occupation || null;
-        const location = null;
-        if (publicIdentifier) results.push({ fullName, headline, location, publicIdentifier });
-        if (results.length >= 10) break;
-    }
+    try {
+        const elements = Array.isArray(raw?.data?.elements) ? raw.data.elements : [];
+        const personRows: any[] = [];
+        for (const section of elements) {
+            const items = Array.isArray(section?.elements) ? section.elements : [];
+            for (const item of items) personRows.push(item);
+        }
+        for (const row of personRows) {
+            const publicIdentifier = row?.publicIdentifier || row?.target?.publicIdentifier || row?.title?.text?.text || '';
+            if (!publicIdentifier) continue;
+            const first = row?.title?.text?.text?.split(' ')?.[0] || '';
+            const last = row?.title?.text?.text?.split(' ')?.slice(1).join(' ') || '';
+            const fullName = `${first} ${last}`.trim() || row?.title?.text?.text || 'Unknown';
+            const headline = row?.headline?.text?.text || row?.subtitle?.text?.text || null;
+            results.push({ fullName, headline, location: null, publicIdentifier });
+            if (results.length >= 25) break;
+        }
+        if (results.length === 0) {
+            // fallback to included/miniprofile if present
+            const included: any[] = Array.isArray(raw?.included) ? raw.included : [];
+            const byType: Record<string, any[]> = {};
+            for (const item of included) {
+                const t = String(item?.$type || 'unknown');
+                (byType[t] ||= []).push(item);
+            }
+            const miniProfiles = Object.entries(byType)
+                .filter(([t]) => String(t).toLowerCase().includes('miniprofile'))
+                .flatMap(([, arr]) => arr);
+            for (const mp of miniProfiles) {
+                const first = mp?.firstName || '';
+                const last = mp?.lastName || '';
+                const fullName = `${first} ${last}`.trim();
+                const publicIdentifier = mp?.publicIdentifier || '';
+                const headline = mp?.occupation || null;
+                if (publicIdentifier) results.push({ fullName, headline, location: null, publicIdentifier });
+                if (results.length >= 25) break;
+            }
+        }
+    } catch { }
     return results;
 }
 
 async function searchAccounts(auth: BearerAuth, query: string, limit = 10): Promise<SearchAccountResult[]> {
     const raw = await manualSearchPeopleRaw(auth, query, limit);
-    return parsePeopleFromBlended(raw).slice(0, limit);
+    const results = parsePeopleFromBlended(raw).slice(0, limit);
+    dbg('parsed search results:', results.length);
+    if (results.length === 0) {
+        // Try a gentler origin and no filters as a fallback
+        const q = encodeURIComponent(query);
+        const referer = `https://www.linkedin.com/search/results/people/?keywords=${q}`;
+        const path = `/voyager/api/search/blended?keywords=${q}&q=all&count=${Math.min(Math.max(limit, 1), 25)}&start=0`;
+        try {
+            dbg('search blended (alt) request');
+            const alt = await manualGet(auth, path, referer, 'search-blended-alt');
+            const parsed = parsePeopleFromBlended(alt).slice(0, limit);
+            dbg('parsed alt search results:', parsed.length);
+            return parsed;
+        } catch (e: any) { dbg('search blended (alt) failed:', e?.message || String(e)); }
+    }
+    return results;
 }
 
 async function getProfile(auth: BearerAuth, publicIdentifier: string): Promise<ProfileResult> {
@@ -303,7 +366,8 @@ async function getProfile(auth: BearerAuth, publicIdentifier: string): Promise<P
 
 async function handle(req: IncomingMessage, res: ServerResponse) {
     try {
-        if (req.method !== 'POST' || (req.url || '') !== '/mcp') {
+        const urlPath = String(req.url || '');
+        if (req.method !== 'POST' || (urlPath !== '/mcp' && urlPath !== '/api/mcp')) {
             json(res, 404, { error: 'Not Found' });
             return;
         }
@@ -358,6 +422,7 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
             try {
                 if (body.name === 'search_accounts') {
                     const q = body.params?.query || '';
+                    dbg('search_accounts:', { q, limit: body.params?.limit });
                     const limit = Math.min(Math.max(Number(body.params?.limit ?? 10), 1), 25);
                     try {
                         const results = await searchAccounts(auth, q, limit);
@@ -365,6 +430,7 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
                     } catch (e: any) {
                         const status = e?.response?.status;
                         const note = status ? `search denied by LinkedIn (status ${status})` : 'search failed';
+                        dbg('search_accounts failed:', e?.message || String(e));
                         json(res, 200, { results: [], note });
                     }
                     return;

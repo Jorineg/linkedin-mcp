@@ -49,6 +49,8 @@ function callMcp(body: any, bearerJson: any): Promise<any> {
         process.exit(1);
     }
 
+    console.log('Bearer:', bearer);
+
     // Test list_tools
     const tools = await callMcp({ type: 'list_tools' }, bearer);
     console.log('Tools:', tools);

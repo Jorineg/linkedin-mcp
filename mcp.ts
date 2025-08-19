@@ -1,5 +1,5 @@
 import { createServer, IncomingMessage, ServerResponse } from 'http';
-import { Client } from 'linkedin-private-api';
+import LinkedInPkg from 'linkedin-private-api';
 import fs from 'fs/promises';
 
 type BearerAuth = { username: string; password: string };
@@ -102,10 +102,11 @@ async function withRetry<T>(fn: () => Promise<T>, label: string): Promise<T> {
     return fn();
 }
 
-async function loginClient(auth: BearerAuth): Promise<Client> {
+async function loginClient(auth: BearerAuth): Promise<any> {
     // Always reset cached sessions as requested
     try { await fs.unlink('sessions.json'); } catch { }
-    const client = new Client();
+    const ClientCtor = (LinkedInPkg as any).Client;
+    const client = new ClientCtor();
     await client.login.userPass({ username: auth.username, password: auth.password, useCache: false });
     return client;
 }
@@ -116,7 +117,7 @@ function normalizeDate(obj: any): string | undefined {
     return s || undefined;
 }
 
-async function searchAccounts(client: Client, query: string, limit = 10): Promise<SearchAccountResult[]> {
+async function searchAccounts(client: any, query: string, limit = 10): Promise<SearchAccountResult[]> {
     try {
         try {
             const defaults: any = (client as any).request.request.defaults.headers;
@@ -128,8 +129,8 @@ async function searchAccounts(client: Client, query: string, limit = 10): Promis
         } catch { }
         await sleep(1200);
         const scroller = await client.search.searchPeople({ keywords: query, limit });
-        const hits = await withRetry(() => scroller.scrollNext(), 'people.scrollNext');
-        return hits.slice(0, limit).map((hit) => {
+        const hits: any[] = await withRetry(() => scroller.scrollNext(), 'people.scrollNext');
+        return hits.slice(0, limit).map((hit: any) => {
             const first = (hit.profile as any).firstName || '';
             const last = (hit.profile as any).lastName || '';
             const fullName = `${first} ${last}`.trim();
@@ -142,7 +143,7 @@ async function searchAccounts(client: Client, query: string, limit = 10): Promis
     }
 }
 
-async function getProfile(client: Client, publicIdentifier: string): Promise<ProfileResult> {
+async function getProfile(client: any, publicIdentifier: string): Promise<ProfileResult> {
     try {
         const defaults: any = (client as any).request.request.defaults.headers;
         (client as any).request.setHeaders({
@@ -153,9 +154,9 @@ async function getProfile(client: Client, publicIdentifier: string): Promise<Pro
     } catch { }
     await sleep(800);
     // High-level object
-    const profile = await withRetry(() => client.profile.getProfile({ publicIdentifier }), 'profile.getProfile');
+    const profile: any = await withRetry(() => client.profile.getProfile({ publicIdentifier }), 'profile.getProfile');
     // Raw response for included entities
-    const raw = await withRetry(() => (client as any).request.profile.getProfile({ publicIdentifier }), 'profile.getProfile(raw)');
+    const raw: any = await withRetry(() => (client as any).request.profile.getProfile({ publicIdentifier }), 'profile.getProfile(raw)');
     const included: any[] = Array.isArray(raw?.included) ? raw.included : [];
 
     const byType: Record<string, any[]> = {};
@@ -196,14 +197,14 @@ async function getProfile(client: Client, publicIdentifier: string): Promise<Pro
 
     const skills = skillsArr
         .map((s: any) => s?.name || s?.skill?.name || s?.entityLocalizedName)
-        .filter(Boolean);
+        .filter(Boolean) as string[];
 
     const first = (profile as any).firstName || (profile as any).localizedFirstName || '';
     const last = (profile as any).lastName || (profile as any).localizedLastName || '';
     const fullName = `${first} ${last}`.trim();
     const birthDate = (profile as any).birthDateOn || null;
     const summary = (profile as any).summary
-        || (profile as any).multiLocaleSummary && Object.values((profile as any).multiLocaleSummary)[0]
+        || ((profile as any).multiLocaleSummary && Object.values((profile as any).multiLocaleSummary as any)[0])
         || null;
 
     return { fullName, birthDate, summary, experience, education, skills };

@@ -8,8 +8,7 @@
     "test:mcp": "tsx test_mcp.ts"
   },
   "dependencies": {
-    "dotenv": "^17.2.1",
-    "linkedin-private-api": "^1.1.2"
+    "dotenv": "^17.2.1"
   },
   "devDependencies": {
     "@types/node": "^22.5.0",

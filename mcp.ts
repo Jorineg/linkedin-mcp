@@ -1,7 +1,5 @@
 import { createServer, IncomingMessage, ServerResponse } from 'http';
 import https from 'https';
-import LinkedInPkg from 'linkedin-private-api';
-import fs from 'fs/promises';
 import dotenv from 'dotenv';
 dotenv.config();
 
@@ -101,110 +99,6 @@ function getAuthFromEnv(): BearerAuth | null {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-async function withRetry<T>(fn: () => Promise<T>, label: string): Promise<T> {
-    let attempt = 0;
-    while (attempt < 5) {
-        try {
-            return await fn();
-        } catch (err: any) {
-            const status = err?.response?.status;
-            if (status === 429) {
-                const retryAfter = Number(err?.response?.headers?.['retry-after']);
-                const backoffMs = retryAfter ? retryAfter * 1000 : Math.min(30000, (1000 * 2 ** attempt) + Math.floor(Math.random() * 500));
-                attempt += 1;
-                await sleep(backoffMs);
-                continue;
-            }
-            if (status === 404 && attempt < 2) {
-                attempt += 1;
-                await sleep(1000);
-                continue;
-            }
-            throw err;
-        }
-    }
-    return fn();
-}
-
-async function loginClient(auth: BearerAuth): Promise<any> {
-    if (process.env.LI_RESET === '1') { try { await fs.unlink('sessions.json'); } catch { } }
-    const ClientCtor = (LinkedInPkg as any).Client;
-    const client = new ClientCtor();
-    if (auth.cookies) {
-        const rawCookies = Array.isArray(auth.cookies) ? auth.cookies : JSON.parse(String(auth.cookies));
-        // Normalize JSESSIONID since some exporters include quotes in the value
-        const cookiesArr = rawCookies.map((c: any) => {
-            if (!c || typeof c !== 'object') return c;
-            if (String(c.name).toUpperCase() === 'JSESSIONID' && typeof c.value === 'string') {
-                const v = c.value;
-                const unquoted = v.length >= 2 && v.startsWith('"') && v.endsWith('"') ? v.slice(1, -1) : v;
-                return { ...c, value: unquoted };
-            }
-            return c;
-        });
-        const username = auth.username || process.env.LI_USERNAME || '';
-        try {
-            const cookieNames = cookiesArr.map((c: any) => String(c?.name)).filter(Boolean);
-            const hasLiAt = cookieNames.includes('li_at');
-            const hasJs = cookieNames.includes('JSESSIONID');
-            // eslint-disable-next-line no-console
-            if (!hasLiAt) console.warn('LI_COOKIES: missing li_at cookie; authentication will fail');
-            // eslint-disable-next-line no-console
-            if (!hasJs) console.warn('LI_COOKIES: missing JSESSIONID cookie; CSRF will fail');
-        } catch { }
-        // Disable cache for cookie-based logins to avoid mixing stale saved sessions
-        await client.login.userCookie({ username, cookies: cookiesArr, useCache: false });
-        // Ensure csrf-token header matches JSESSIONID value and keep a copy on the client
-        try {
-            const js = cookiesArr.find((c: any) => String(c?.name).toUpperCase() === 'JSESSIONID');
-            const token = js?.value;
-            if (token) {
-                (client as any).__csrf = String(token);
-                (client as any).request.setHeaders({ 'csrf-token': String(token) });
-            }
-        } catch { }
-        return client;
-    }
-    if (auth.username && auth.password) {
-        await client.login.userPass({ username: auth.username, password: auth.password, useCache: true });
-        return client;
-    }
-    throw new Error('No valid auth provided');
-}
-
-function setMergedHeaders(client: any, extra: Record<string, string>): void {
-    try {
-        const defaults: any = (client as any).request?.request?.defaults?.headers || {};
-        const safe: any = {};
-        for (const [k, v] of Object.entries(defaults)) {
-            if (v !== undefined && v !== null && String(v) !== 'undefined') safe[k] = v as any;
-        }
-        const csrf = safe['csrf-token'] || (client as any).__csrf;
-        if (csrf) safe['csrf-token'] = csrf as any;
-        (client as any).request.setHeaders({ ...safe, ...extra });
-    } catch { }
-}
-
-async function probeFirstRedirect(client: any): Promise<{ status: number; location?: string; finalUrl?: string } | null> {
-    try {
-        const axios: any = (client as any).request?.request;
-        if (!axios) return null;
-        const prevMax = axios.defaults?.maxRedirects;
-        axios.defaults.maxRedirects = 0;
-        // Set a realistic UA/referer for the probe
-        setMergedHeaders(client, {
-            'user-agent': process.env.LI_UA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-            referer: 'https://www.linkedin.com/feed/'
-        });
-        const resp = await axios.get('https://www.linkedin.com/feed/', { validateStatus: () => true });
-        const info = { status: Number(resp?.status) || 0, location: resp?.headers?.['location'], finalUrl: resp?.request?.res?.responseUrl };
-        axios.defaults.maxRedirects = prevMax;
-        return info;
-    } catch {
-        return null;
-    }
-}
 
 function serializeCookieHeader(arr: any[]): string {
     const parts: string[] = [];
@@ -362,97 +256,49 @@ function parseVoyagerProfile(raw: any): ProfileResult {
     return { fullName, birthDate, summary, experience, education, skills };
 }
 
-function normalizeDate(obj: any): string | undefined {
-    const y = obj?.year, m = obj?.month, d = obj?.day;
-    const s = [y, m, d].filter(Boolean).join('-');
-    return s || undefined;
+async function manualSearchPeopleRaw(auth: BearerAuth, query: string, limit = 10): Promise<any> {
+    const q = encodeURIComponent(query);
+    const start = 0;
+    const count = Math.min(Math.max(limit, 1), 25);
+    const filters = encodeURIComponent('List(resultType->PEOPLE)');
+    const path = `/voyager/api/search/people?keywords=${q}&origin=GLOBAL_SEARCH_HEADER&q=all&filters=${filters}&count=${count}&start=${start}`;
+    const referer = `https://www.linkedin.com/search/results/people/?keywords=${q}`;
+    return await manualGet(auth, path, referer);
 }
 
-async function searchAccounts(client: any, query: string, limit = 10): Promise<SearchAccountResult[]> {
-    try {
-        setMergedHeaders(client, {
-            'user-agent': process.env.LI_UA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:141.0) Gecko/20100101 Firefox/141.0',
-            referer: `https://www.linkedin.com/search/results/people/?keywords=${encodeURIComponent(query)}`,
-        });
-        await sleep(1200);
-        const scroller = await client.search.searchPeople({ keywords: query, limit });
-        const hits: any[] = await withRetry(() => scroller.scrollNext(), 'people.scrollNext');
-        return hits.slice(0, limit).map((hit: any) => {
-            const first = (hit.profile as any).firstName || '';
-            const last = (hit.profile as any).lastName || '';
-            const fullName = `${first} ${last}`.trim();
-            const headline = (hit.profile as any).occupation || null;
-            const publicIdentifier = (hit.profile as any).publicIdentifier;
-            return { fullName, headline, location: null, publicIdentifier };
-        });
-    } catch (err: any) {
-        throw err;
-    }
-}
-
-async function getProfile(client: any, publicIdentifier: string): Promise<ProfileResult> {
-    try {
-        setMergedHeaders(client, {
-            'user-agent': process.env.LI_UA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-            referer: `https://www.linkedin.com/in/${publicIdentifier.replace(/^\/*in\/*/, '')}/`,
-        });
-    } catch { }
-    await sleep(800);
-    // High-level object
-    const profile: any = await withRetry(() => client.profile.getProfile({ publicIdentifier }), 'profile.getProfile');
-    // Raw response for included entities
-    const raw: any = await withRetry(() => (client as any).request.profile.getProfile({ publicIdentifier }), 'profile.getProfile(raw)');
+function parsePeopleFromBlended(raw: any): SearchAccountResult[] {
     const included: any[] = Array.isArray(raw?.included) ? raw.included : [];
-
     const byType: Record<string, any[]> = {};
     for (const item of included) {
-        const t = item?.$type || 'unknown';
-        if (!byType[t]) byType[t] = [];
-        byType[t].push(item);
+        const t = String(item?.$type || 'unknown');
+        (byType[t] ||= []).push(item);
     }
     const isType = (s: string, needle: string) => s.toLowerCase().includes(needle);
-
-    const positions = Object.entries(byType)
-        .filter(([t]) => isType(t, 'position') || isType(t, 'positiongroup'))
+    const miniProfiles = Object.entries(byType)
+        .filter(([t]) => isType(t, 'miniprofile'))
         .flatMap(([, arr]) => arr);
-    const educations = Object.entries(byType)
-        .filter(([t]) => isType(t, 'education'))
-        .flatMap(([, arr]) => arr);
-    const skillsArr = Object.entries(byType)
-        .filter(([t]) => isType(t, 'skill'))
-        .flatMap(([, arr]) => arr);
+    const results: SearchAccountResult[] = [];
+    for (const mp of miniProfiles) {
+        const first = mp?.firstName || '';
+        const last = mp?.lastName || '';
+        const fullName = `${first} ${last}`.trim();
+        const publicIdentifier = mp?.publicIdentifier || '';
+        const headline = mp?.occupation || null;
+        const location = null;
+        if (publicIdentifier) results.push({ fullName, headline, location, publicIdentifier });
+        if (results.length >= 10) break;
+    }
+    return results;
+}
 
-    const experience: ExperienceItem[] = positions.map((p: any) => {
-        const title = p?.title || p?.name || p?.positionName || p?.localizedTitle || null;
-        const company = p?.companyName || p?.company?.name || p?.entityLocalizedName || null;
-        const time = p?.timePeriod || p?.dateRange || {};
-        const start = normalizeDate(time?.startDate || time?.start || {});
-        const end = normalizeDate(time?.endDate || time?.end || {});
-        return { title, company, start, end };
-    });
+async function searchAccounts(auth: BearerAuth, query: string, limit = 10): Promise<SearchAccountResult[]> {
+    const raw = await manualSearchPeopleRaw(auth, query, limit);
+    return parsePeopleFromBlended(raw).slice(0, limit);
+}
 
-    const education: EducationItem[] = educations.map((e: any) => {
-        const school = e?.schoolName || e?.school?.name || e?.entityLocalizedName || null;
-        const degree = e?.degreeName || e?.degree || e?.fieldOfStudy || null;
-        const time = e?.timePeriod || e?.dateRange || {};
-        const start = normalizeDate(time?.startDate || time?.start || {});
-        const end = normalizeDate(time?.endDate || time?.end || {});
-        return { school, degree, start, end };
-    });
-
-    const skills = skillsArr
-        .map((s: any) => s?.name || s?.skill?.name || s?.entityLocalizedName)
-        .filter(Boolean) as string[];
-
-    const first = (profile as any).firstName || (profile as any).localizedFirstName || '';
-    const last = (profile as any).lastName || (profile as any).localizedLastName || '';
-    const fullName = `${first} ${last}`.trim();
-    const birthDate = (profile as any).birthDateOn || null;
-    const summary = (profile as any).summary
-        || ((profile as any).multiLocaleSummary && Object.values((profile as any).multiLocaleSummary as any)[0])
-        || null;
-
-    return { fullName, birthDate, summary, experience, education, skills };
+async function getProfile(auth: BearerAuth, publicIdentifier: string): Promise<ProfileResult> {
+    const raw = await manualGetProfileRaw(auth, publicIdentifier);
+    return parseVoyagerProfile(raw);
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse) {
@@ -509,19 +355,12 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
                 json(res, 200, { probe });
                 return;
             }
-            const client = await loginClient(auth);
-            if (process.env.LI_DEBUG_REDIRECTS === '1') {
-                const probe = await probeFirstRedirect(client);
-                // eslint-disable-next-line no-console
-                if (probe) console.log('LinkedIn probe:', probe);
-                else console.log('No probe response');
-            }
             try {
                 if (body.name === 'search_accounts') {
                     const q = body.params?.query || '';
                     const limit = Math.min(Math.max(Number(body.params?.limit ?? 10), 1), 25);
                     try {
-                        const results = await searchAccounts(client, q, limit);
+                        const results = await searchAccounts(auth, q, limit);
                         json(res, 200, { results });
                     } catch (e: any) {
                         const status = e?.response?.status;
@@ -539,7 +378,7 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
                     // brief throttle to reduce rate limiting
                     await sleep(500);
                     try {
-                        const result = await getProfile(client, publicIdentifier);
+                        const result = await getProfile(auth as any, publicIdentifier);
                         json(res, 200, { result });
                     } catch (e: any) {
                         const status = e?.response?.status;

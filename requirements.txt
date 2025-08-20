@@ -2,4 +2,5 @@ fastmcp
 requests
 fastapi
 uvicorn
+python-dotenv
 

@@ -1,29 +1,15 @@
 {
     "version": 2,
-    "rewrites": [
+    "builds": [
         {
-            "source": "/mcp",
-            "destination": "/api/mcp"
-        },
+            "src": "server.py",
+            "use": "@vercel/python"
+        }
+    ],
+    "routes": [
         {
-            "source": "/register",
-            "destination": "/api/mcp"
-        },
-        {
-            "source": "/.well-known/oauth-protected-resource",
-            "destination": "/api/mcp"
-        },
-        {
-            "source": "/.well-known/oauth-authorization-server",
-            "destination": "/api/mcp"
-        },
-        {
-            "source": "/oauth/authorize",
-            "destination": "/api/mcp"
-        },
-        {
-            "source": "/oauth/token",
-            "destination": "/api/mcp"
+            "src": "/(.*)",
+            "dest": "server.py"
         }
     ]
 }

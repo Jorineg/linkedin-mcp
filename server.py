@@ -334,18 +334,30 @@ try:
     base_app = mcp.http_app(stateless_http=True)
 
     # Some serverless ASGI adapters do not run lifespan events.
-    # Wrap the app so its lifespan runs per-request, ensuring the
-    # StreamableHTTPSessionManager task group is initialized.
-    class LifespanPerRequest:
+    # Start lifespan once on first request and keep it open for the
+    # lifetime of the function instance so the task group persists.
+    import asyncio
+    from contextlib import AsyncExitStack
+
+    _lifespan_started = False
+    _lifespan_stack = AsyncExitStack()
+    _lifespan_lock = asyncio.Lock()
+
+    class PersistentLifespanApp:
         def __init__(self, inner_app):
             self.inner_app = inner_app
 
         async def __call__(self, scope, receive, send):
-            lifespan_cm = self.inner_app.lifespan(self.inner_app)  # type: ignore[attr-defined]
-            async with lifespan_cm:
-                await self.inner_app(scope, receive, send)
+            global _lifespan_started
+            if not _lifespan_started:
+                async with _lifespan_lock:
+                    if not _lifespan_started:
+                        cm = self.inner_app.lifespan(self.inner_app)  # type: ignore[attr-defined]
+                        await _lifespan_stack.enter_async_context(cm)
+                        _lifespan_started = True
+            await self.inner_app(scope, receive, send)
 
-    app = LifespanPerRequest(base_app)
+    app = PersistentLifespanApp(base_app)
 except Exception:  # pragma: no cover
     app = None  # type: ignore
 

@@ -52,8 +52,8 @@ function callMcp(body: any, bearerToken: string): Promise<any> {
     // console.log('Search results:', JSON.stringify(searchResp, null, 2));
 
     // Manual cookie auth probe first
-    const authProbe = await callMcp({ type: 'call_tool', name: 'auth_probe', params: {} }, bearerToken);
-    console.log('Auth probe:', JSON.stringify(authProbe, null, 2));
+    // const authProbe = await callMcp({ type: 'call_tool', name: 'auth_probe', params: {} }, bearerToken);
+    // console.log('Auth probe:', JSON.stringify(authProbe, null, 2));
 
     // Then get_profile if configured
     const publicIdentifier = process.env.LI_PUBLIC_ID;

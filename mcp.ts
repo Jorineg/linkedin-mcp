@@ -22,6 +22,7 @@ type SearchAccountResult = {
 type ExperienceItem = {
     title: string | null;
     company: string | null;
+    description: string | null;
     start?: string;
     end?: string;
 };
@@ -35,8 +36,10 @@ type EducationItem = {
 
 type ProfileResult = {
     fullName: string;
-    birthDate?: string | null;
-    summary?: string | null;
+    headline?: string | null;
+    occupation?: string | null;
+    location?: string | null;
+    industry?: string | null;
     experience: ExperienceItem[];
     education: EducationItem[];
     skills: string[];
@@ -266,6 +269,10 @@ async function manualGetProfileRaw(auth: BearerAuth, publicIdentifier: string): 
 }
 
 function parseVoyagerProfile(raw: any): ProfileResult {
+    if (process.env.LI_DEBUG === '1') {
+        // eslint-disable-next-line no-console
+        console.log(raw);
+    }
     const included: any[] = Array.isArray(raw?.included) ? raw.included : [];
     const byType: Record<string, any[]> = {};
     for (const item of included) {
@@ -274,13 +281,44 @@ function parseVoyagerProfile(raw: any): ProfileResult {
     }
     const isType = (s: string, needle: string) => s.toLowerCase().includes(needle);
 
-    const miniProfiles = Object.entries(byType)
-        .filter(([t]) => isType(t, 'miniprofile'))
-        .flatMap(([, arr]) => arr);
-    const mini = miniProfiles[0] || {};
-    const first = mini?.firstName || '';
-    const last = mini?.lastName || '';
+    const findByEntityUrn = (urn?: string) => included.find((i: any) => i?.entityUrn === urn);
+
+    // Prefer exact profile via URN from data, otherwise fall back to type match
+    const profileUrn = raw?.data?.['*profile'];
+    let profile: any = (profileUrn && findByEntityUrn(profileUrn)) || null;
+    if (!profile) {
+        const profiles = Object.entries(byType)
+            .filter(([t]) => isType(t, 'identity.profile.profile'))
+            .flatMap(([, arr]) => arr);
+        profile = profiles[0] || null;
+    }
+
+    // Resolve MiniProfile for occupation/full name fallback
+    const miniProfileUrn = profile?.['*miniProfile'];
+    let miniProfile: any = (miniProfileUrn && findByEntityUrn(miniProfileUrn)) || null;
+    if (!miniProfile) {
+        const minis = Object.entries(byType)
+            .filter(([t]) => isType(t, 'identity.shared.miniprofile'))
+            .flatMap(([, arr]) => arr);
+        miniProfile = minis[0] || null;
+    }
+
+    // Fallback scanning if above resolution failed
+    const anyWithName = (!profile && !miniProfile)
+        ? included.find((i: any) => typeof i?.firstName === 'string' && typeof i?.lastName === 'string')
+        : null;
+    const anyWithHeadline = included.find((i: any) => typeof i?.headline === 'string');
+    const anyWithOccupation = included.find((i: any) => typeof i?.occupation === 'string');
+    const anyWithLocation = included.find((i: any) => typeof i?.geoLocationName === 'string' || typeof i?.locationName === 'string');
+    const anyWithIndustry = included.find((i: any) => typeof i?.industryName === 'string');
+
+    const first = profile?.firstName || miniProfile?.firstName || anyWithName?.firstName || '';
+    const last = profile?.lastName || miniProfile?.lastName || anyWithName?.lastName || '';
     const fullName = `${first} ${last}`.trim();
+    const headline = (profile?.headline ?? anyWithHeadline?.headline) ?? null;
+    const occupation = (miniProfile?.occupation ?? anyWithOccupation?.occupation) ?? null;
+    const location = (profile?.geoLocationName || profile?.locationName || anyWithLocation?.geoLocationName || anyWithLocation?.locationName) || null;
+    const industry = (profile?.industryName || anyWithIndustry?.industryName) || null;
 
     const positions = Object.entries(byType)
         .filter(([t]) => isType(t, 'position') || isType(t, 'positiongroup'))
@@ -301,10 +339,11 @@ function parseVoyagerProfile(raw: any): ProfileResult {
     const experience: ExperienceItem[] = positions.map((p: any) => {
         const title = p?.title || p?.name || p?.positionName || p?.localizedTitle || null;
         const company = p?.companyName || p?.company?.name || p?.entityLocalizedName || null;
+        const description = p?.description || null;
         const time = p?.timePeriod || p?.dateRange || {};
         const start = normalizeDate(time?.startDate || time?.start || {});
         const end = normalizeDate(time?.endDate || time?.end || {});
-        return { title, company, start, end };
+        return { title, company, description, start, end };
     });
 
     const education: EducationItem[] = educations.map((e: any) => {
@@ -320,9 +359,8 @@ function parseVoyagerProfile(raw: any): ProfileResult {
         .map((s: any) => s?.name || s?.skill?.name || s?.entityLocalizedName)
         .filter(Boolean) as string[];
 
-    const birthDate = null;
-    const summary = null;
-    return { fullName, birthDate, summary, experience, education, skills };
+
+    return { fullName, headline, occupation, location, industry, experience, education, skills };
 }
 
 async function manualSearchPeopleRaw(auth: BearerAuth, query: string, limit = 10): Promise<any> {

@@ -1,5 +1,6 @@
 import { createServer, IncomingMessage, ServerResponse } from 'http';
 import https from 'https';
+import crypto from 'crypto';
 import dotenv from 'dotenv';
 dotenv.config();
 
@@ -56,8 +57,48 @@ const parseBody = async (req: IncomingMessage): Promise<any> => {
         chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
     }
     const raw = Buffer.concat(chunks).toString('utf8');
-    return raw ? JSON.parse(raw) : {};
+    if (!raw) return {};
+    // Try JSON first
+    try { return JSON.parse(raw); } catch { /* fall through */ }
+    // Fallback: parse x-www-form-urlencoded
+    const params = new URLSearchParams(raw);
+    const obj: Record<string, any> = {};
+    for (const [k, v] of params.entries()) obj[k] = v;
+    return obj;
 };
+
+// In-memory OAuth storage (ephemeral)
+const issuedAuthCodes = new Map<string, {
+    code_challenge?: string;
+    code_challenge_method?: 'S256' | 'plain';
+    createdAt: number;
+    // Persist the credentials captured during authorize step
+    authInfo: BearerAuth;
+}>();
+const issuedAccessTokens = new Map<string, {
+    authInfo: BearerAuth;
+    createdAt: number;
+    expiresAt: number; // epoch ms
+}>();
+
+function baseUrlFrom(req: IncomingMessage): string {
+    const proto = (req.headers['x-forwarded-proto'] as string) || (req.socket as any)?.encrypted ? 'https' : 'http';
+    const host = String(req.headers['x-forwarded-host'] || req.headers['host'] || 'localhost');
+    return `${proto}://${host}`;
+}
+
+function setWwwAuthenticate(res: ServerResponse, baseUrl: string) {
+    const wwwAuthHeader = `Bearer realm="MCP Server", resource_metadata_uri="${baseUrl}/.well-known/oauth-protected-resource"`;
+    res.setHeader('WWW-Authenticate', wwwAuthHeader);
+}
+
+function b64urlSha256(input: string): string {
+    const hash = crypto.createHash('sha256').update(input).digest('base64')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/g, '');
+    return hash;
+}
 
 const parseBearer = (req: IncomingMessage): BearerAuth => {
     const auth = (req.headers['authorization'] as any) || (req.headers['Authorization' as any] as any);
@@ -65,6 +106,15 @@ const parseBearer = (req: IncomingMessage): BearerAuth => {
         throw new Error('Missing Bearer auth');
     }
     const token = auth.slice('Bearer '.length).trim();
+    // 1) If token matches an issued OAuth access token, return mapped credentials
+    const fromIssued = issuedAccessTokens.get(token);
+    if (fromIssued) {
+        if (Date.now() > fromIssued.expiresAt) {
+            issuedAccessTokens.delete(token);
+        } else {
+            return fromIssued.authInfo;
+        }
+    }
     const tryParse = (s: string) => { try { return JSON.parse(s); } catch { return null; } };
     let creds: any = tryParse(token);
     if (!creds) {
@@ -366,7 +416,109 @@ async function getProfile(auth: BearerAuth, publicIdentifier: string): Promise<P
 
 async function handle(req: IncomingMessage, res: ServerResponse) {
     try {
+        // Propagate Mcp-Session-Id
+        const incomingSessionId = String((req.headers['mcp-session-id'] as string) || '').trim();
+        const effectiveSessionId = incomingSessionId || crypto.randomBytes(8).toString('hex');
+        res.setHeader('Mcp-Session-Id', effectiveSessionId);
+
         const urlPath = String(req.url || '');
+        const baseUrl = baseUrlFrom(req);
+
+        // OAuth 2.1 discovery: protected resource metadata
+        if (req.method === 'GET' && (urlPath === '/.well-known/oauth-protected-resource')) {
+            json(res, 200, {
+                issuer: baseUrl,
+                authorization_servers: [`${baseUrl}/.well-known/oauth-authorization-server`]
+            });
+            return;
+        }
+
+        // OAuth 2.1 discovery: authorization server metadata
+        if (req.method === 'GET' && (urlPath === '/.well-known/oauth-authorization-server')) {
+            json(res, 200, {
+                issuer: baseUrl,
+                authorization_endpoint: `${baseUrl}/oauth/authorize`,
+                token_endpoint: `${baseUrl}/oauth/token`,
+                code_challenge_methods_supported: ['S256', 'plain'],
+                grant_types_supported: ['authorization_code'],
+                response_types_supported: ['code']
+            });
+            return;
+        }
+
+        // OAuth 2.1 authorization endpoint (minimal; expects Authorization header with credentials)
+        if (req.method === 'GET' && urlPath.startsWith('/oauth/authorize')) {
+            const urlObj = new URL(baseUrl + urlPath);
+            const response_type = urlObj.searchParams.get('response_type') || 'code';
+            const redirect_uri = urlObj.searchParams.get('redirect_uri') || '';
+            const state = urlObj.searchParams.get('state') || '';
+            const code_challenge = urlObj.searchParams.get('code_challenge') || undefined;
+            const code_challenge_method = (urlObj.searchParams.get('code_challenge_method') as any) || 'S256';
+            if (response_type !== 'code') {
+                json(res, 400, { error: 'unsupported_response_type' });
+                return;
+            }
+            let authInfo: BearerAuth | null = null;
+            try { authInfo = parseBearer(req); } catch { authInfo = getAuthFromEnv(); }
+            if (!authInfo) {
+                setWwwAuthenticate(res, baseUrl);
+                json(res, 401, { error: 'Missing credentials for authorization' });
+                return;
+            }
+            const code = crypto.randomBytes(24).toString('hex');
+            issuedAuthCodes.set(code, {
+                code_challenge,
+                code_challenge_method: (code_challenge_method === 'plain' ? 'plain' : 'S256'),
+                createdAt: Date.now(),
+                authInfo
+            });
+            if (redirect_uri) {
+                const sep = redirect_uri.includes('?') ? '&' : '?';
+                const loc = `${redirect_uri}${sep}code=${encodeURIComponent(code)}${state ? `&state=${encodeURIComponent(state)}` : ''}`;
+                res.statusCode = 302;
+                res.setHeader('Location', loc);
+                res.end();
+                return;
+            }
+            json(res, 200, { code, state });
+            return;
+        }
+
+        // OAuth 2.1 token endpoint (authorization_code + PKCE)
+        if (req.method === 'POST' && urlPath === '/oauth/token') {
+            const body = await parseBody(req);
+            const grant_type = String(body.grant_type || '');
+            if (grant_type !== 'authorization_code') {
+                json(res, 400, { error: 'unsupported_grant_type' });
+                return;
+            }
+            const code = String(body.code || '');
+            const code_verifier = String(body.code_verifier || '');
+            const data = issuedAuthCodes.get(code);
+            if (!data) {
+                json(res, 400, { error: 'invalid_grant' });
+                return;
+            }
+            if (data.code_challenge) {
+                if (!code_verifier) {
+                    json(res, 400, { error: 'code_verifier_required' });
+                    return;
+                }
+                const calculated = (data.code_challenge_method === 'S256') ? b64urlSha256(code_verifier) : code_verifier;
+                if (calculated !== data.code_challenge) {
+                    json(res, 401, { error: 'invalid_code_verifier' });
+                    return;
+                }
+            }
+            issuedAuthCodes.delete(code);
+            const access_token = crypto.randomBytes(32).toString('hex');
+            const now = Date.now();
+            const ttlMs = 3600 * 1000; // 1 hour
+            issuedAccessTokens.set(access_token, { authInfo: data.authInfo, createdAt: now, expiresAt: now + ttlMs });
+            json(res, 200, { access_token, token_type: 'Bearer', expires_in: Math.floor(ttlMs / 1000) });
+            return;
+        }
+
         if (req.method !== 'POST' || (urlPath !== '/mcp' && urlPath !== '/api/mcp')) {
             json(res, 404, { error: 'Not Found' });
             return;
@@ -379,65 +531,106 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
         } catch (e: any) {
             auth = getAuthFromEnv();
             if (!auth) {
+                setWwwAuthenticate(res, baseUrl);
                 json(res, 401, { error: e?.message || 'Unauthorized' });
                 return;
             }
         }
 
-        const body = await parseBody(req) as McpRequest;
+        const body = await parseBody(req) as any;
         if (!body || typeof body !== 'object') {
             json(res, 400, { error: 'Invalid JSON body' });
             return;
         }
 
-        if (body.type === 'list_tools') {
+        // Support JSON-RPC style for Streamable HTTP compatibility
+        const isJsonRpc = body && body.jsonrpc === '2.0' && typeof body.method === 'string';
+        const rpcId = isJsonRpc ? body.id : undefined;
+
+        const replyRpc = (payload: any) => {
+            if (isJsonRpc) {
+                res.statusCode = 200;
+                res.setHeader('Content-Type', 'application/json');
+                res.end(JSON.stringify({ jsonrpc: '2.0', id: rpcId, ...payload }));
+            } else {
+                json(res, 200, payload);
+            }
+        };
+
+        const method = isJsonRpc ? String(body.method) : undefined;
+        if (body.type === 'list_tools' || method === 'tools/list' || method === 'list_tools') {
             const tools: any[] = [];
             if (ADVERTISE_SEARCH) {
                 tools.push({
                     name: 'search_accounts',
                     description: 'Search LinkedIn people by keywords and return first page of results',
-                    parameters: { query: 'string', limit: 'number (optional, default 10)' }
+                    parameters: {
+                        type: 'object',
+                        additionalProperties: false,
+                        properties: {
+                            query: { type: 'string', description: 'Keywords to search for (e.g. name, title, company)' },
+                            limit: { type: 'integer', minimum: 1, maximum: 25, default: 10 }
+                        },
+                        required: ['query']
+                    }
                 });
             }
             tools.push({
                 name: 'get_profile',
                 description: 'Fetch a LinkedIn profile by publicIdentifier and return summary, experience, education and skills',
-                parameters: { publicIdentifier: 'string' }
+                parameters: {
+                    type: 'object',
+                    additionalProperties: false,
+                    properties: {
+                        publicIdentifier: { type: 'string', description: 'Public identifier from profile URL, e.g. "in/NAME" or plain handle' }
+                    },
+                    required: ['publicIdentifier']
+                }
             });
             tools.push({
                 name: 'auth_probe',
                 description: 'Check cookie auth by calling LinkedIn voyager/api/me directly (manual request)',
-                parameters: {}
+                parameters: { type: 'object', additionalProperties: false, properties: {} }
             });
-            json(res, 200, { tools });
+            if (isJsonRpc) {
+                replyRpc({ result: { tools } });
+            } else {
+                json(res, 200, { tools });
+            }
             return;
         }
 
-        if (body.type === 'call_tool') {
-            if (body.name === 'auth_probe') {
+        if (body.type === 'call_tool' || method === 'tools/call' || method === 'call_tool') {
+            const name = isJsonRpc ? String(body.params?.name || '') : String(body.name || '');
+            const params = isJsonRpc ? (body.params?.arguments || body.params || {}) : (body.params || {});
+            if (name === 'auth_probe') {
                 const probe = await manualAuthProbe(auth);
+                if (isJsonRpc) return replyRpc({ result: { probe } });
                 json(res, 200, { probe });
                 return;
             }
             try {
-                if (body.name === 'search_accounts') {
-                    const q = body.params?.query || '';
-                    dbg('search_accounts:', { q, limit: body.params?.limit });
-                    const limit = Math.min(Math.max(Number(body.params?.limit ?? 10), 1), 25);
+                if (name === 'search_accounts') {
+                    const q = params?.query || '';
+                    dbg('search_accounts:', { q, limit: params?.limit });
+                    const limit = Math.min(Math.max(Number(params?.limit ?? 10), 1), 25);
                     try {
                         const results = await searchAccounts(auth, q, limit);
+                        if (isJsonRpc) return replyRpc({ result: { results } });
                         json(res, 200, { results });
                     } catch (e: any) {
                         const status = e?.response?.status;
                         const note = status ? `search denied by LinkedIn (status ${status})` : 'search failed';
                         dbg('search_accounts failed:', e?.message || String(e));
+                        if (isJsonRpc) return replyRpc({ result: { results: [], note } });
                         json(res, 200, { results: [], note });
                     }
                     return;
                 }
-                if (body.name === 'get_profile') {
-                    const publicIdentifier = body.params?.publicIdentifier;
+                if (name === 'get_profile') {
+                    const publicIdentifier = params?.publicIdentifier;
                     if (!publicIdentifier) {
+                        if (isJsonRpc) return replyRpc({ error: { code: -32602, message: 'publicIdentifier is required' } });
                         json(res, 400, { error: 'publicIdentifier is required' });
                         return;
                     }
@@ -445,6 +638,7 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
                     await sleep(500);
                     try {
                         const result = await getProfile(auth as any, publicIdentifier);
+                        if (isJsonRpc) return replyRpc({ result: { result } });
                         json(res, 200, { result });
                     } catch (e: any) {
                         const status = e?.response?.status;
@@ -454,16 +648,20 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
                             try {
                                 const raw = await manualGetProfileRaw(auth, publicIdentifier);
                                 const parsed = parseVoyagerProfile(raw);
+                                if (isJsonRpc) return replyRpc({ result: { result: parsed, note: 'library failed (CSRF), used manual voyager fallback' } });
                                 json(res, 200, { result: parsed, note: 'library failed (CSRF), used manual voyager fallback' });
                             } catch (fallbackErr: any) {
+                                if (isJsonRpc) return replyRpc({ error: { code: -32000, message: 'LinkedIn library and fallback both failed', data: fallbackErr?.message || String(fallbackErr) } });
                                 json(res, 500, { error: 'LinkedIn library and fallback both failed', data: fallbackErr?.message || String(fallbackErr) });
                             }
                         } else {
+                            if (isJsonRpc) return replyRpc({ error: { code: -32000, message: e?.message || 'Failed to get profile' } });
                             json(res, 500, { error: e?.message || 'Failed to get profile' });
                         }
                     }
                     return;
                 }
+                if (isJsonRpc) return replyRpc({ error: { code: -32601, message: 'Unknown tool' } });
                 json(res, 400, { error: `Unknown tool` });
             } finally {
                 // No persistent connection required

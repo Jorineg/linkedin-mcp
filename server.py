@@ -9,6 +9,13 @@ import requests
 # FastMCP 2.0 API
 from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
+from starlette.applications import Starlette
+from starlette.routing import Route
+from starlette.requests import Request
+from starlette.responses import Response
+from mcp.server.streamable_http import StreamableHTTPServerTransport
+from fastmcp.utilities.logging import get_logger
+from fastmcp.server.http import set_http_request
 
 
 
@@ -328,36 +335,44 @@ def get_profile(publicIdentifier: str) -> Dict[str, Any]:
 
 
 try:
-    # Use FastMCP's built-in ASGI app (per ASGI integration guide)
-    # Endpoint defaults to /mcp/; adjust path if needed
-    # Enable stateless mode for serverless platforms (e.g., Vercel)
-    base_app = mcp.http_app(stateless_http=True)
+    logger = get_logger(__name__)
 
-    # Some serverless ASGI adapters do not run lifespan events.
-    # Start lifespan once on first request and keep it open for the
-    # lifetime of the function instance so the task group persists.
-    import asyncio
-    from contextlib import AsyncExitStack
+    async def mcp_endpoint(request: Request) -> Response:
+        # Provide headers to FastMCP dependency getter
+        with set_http_request(request):
+            transport = StreamableHTTPServerTransport(
+                mcp_session_id=None,
+                is_json_response_enabled=False,
+                event_store=None,
+                security_settings=None,
+            )
 
-    _lifespan_started = False
-    _lifespan_stack = AsyncExitStack()
-    _lifespan_lock = asyncio.Lock()
+            import asyncio
+            async def run_server():
+                async with transport.connect() as streams:
+                    read_stream, write_stream = streams
+                    try:
+                        await mcp._mcp_server.run(
+                            read_stream,
+                            write_stream,
+                            mcp._mcp_server.create_initialization_options(),
+                            stateless=True,
+                        )
+                    except Exception:
+                        logger.exception("Stateless MCP session crashed")
 
-    class PersistentLifespanApp:
-        def __init__(self, inner_app):
-            self.inner_app = inner_app
+            task = asyncio.create_task(run_server())
+            try:
+                await transport.handle_request(request.scope, request.receive, request._send)  # type: ignore[attr-defined]
+            finally:
+                await transport.terminate()
+                try:
+                    await task
+                except Exception:
+                    pass
+        return Response()
 
-        async def __call__(self, scope, receive, send):
-            global _lifespan_started
-            if not _lifespan_started:
-                async with _lifespan_lock:
-                    if not _lifespan_started:
-                        cm = self.inner_app.lifespan(self.inner_app)  # type: ignore[attr-defined]
-                        await _lifespan_stack.enter_async_context(cm)
-                        _lifespan_started = True
-            await self.inner_app(scope, receive, send)
-
-    app = PersistentLifespanApp(base_app)
+    app = Starlette(debug=False, routes=[Route("/mcp", endpoint=mcp_endpoint, methods=["POST"])])
 except Exception:  # pragma: no cover
     app = None  # type: ignore
 

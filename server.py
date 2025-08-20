@@ -330,9 +330,22 @@ def get_profile(publicIdentifier: str) -> Dict[str, Any]:
 try:
     # Use FastMCP's built-in ASGI app (per ASGI integration guide)
     # Endpoint defaults to /mcp/; adjust path if needed
-    # Enable stateless mode for serverless platforms (e.g., Vercel) where lifespan events
-    # may not run, avoiding the need for a background task group
-    app = mcp.http_app(stateless_http=True)
+    # Enable stateless mode for serverless platforms (e.g., Vercel)
+    base_app = mcp.http_app(stateless_http=True)
+
+    # Some serverless ASGI adapters do not run lifespan events.
+    # Wrap the app so its lifespan runs per-request, ensuring the
+    # StreamableHTTPSessionManager task group is initialized.
+    class LifespanPerRequest:
+        def __init__(self, inner_app):
+            self.inner_app = inner_app
+
+        async def __call__(self, scope, receive, send):
+            lifespan_cm = self.inner_app.lifespan(self.inner_app)  # type: ignore[attr-defined]
+            async with lifespan_cm:
+                await self.inner_app(scope, receive, send)
+
+    app = LifespanPerRequest(base_app)
 except Exception:  # pragma: no cover
     app = None  # type: ignore
 

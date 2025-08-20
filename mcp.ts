@@ -84,6 +84,14 @@ const issuedAccessTokens = new Map<string, {
     expiresAt: number; // epoch ms
 }>();
 
+// In-memory dynamic client registration store
+const registeredClients = new Map<string, {
+    client_id: string;
+    client_name?: string;
+    redirect_uris: string[];
+    createdAt: number;
+}>();
+
 function baseUrlFrom(req: IncomingMessage): string {
     const proto = (req.headers['x-forwarded-proto'] as string) || (req.socket as any)?.encrypted ? 'https' : 'http';
     const host = String(req.headers['x-forwarded-host'] || req.headers['host'] || 'localhost');
@@ -477,6 +485,7 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
                 issuer: baseUrl,
                 authorization_endpoint: `${baseUrl}/oauth/authorize`,
                 token_endpoint: `${baseUrl}/oauth/token`,
+                registration_endpoint: `${baseUrl}/register`,
                 code_challenge_methods_supported: ['S256', 'plain'],
                 grant_types_supported: ['authorization_code'],
                 response_types_supported: ['code']
@@ -554,6 +563,29 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
             const ttlMs = 3600 * 1000; // 1 hour
             issuedAccessTokens.set(access_token, { authInfo: data.authInfo, createdAt: now, expiresAt: now + ttlMs });
             json(res, 200, { access_token, token_type: 'Bearer', expires_in: Math.floor(ttlMs / 1000) });
+            return;
+        }
+
+        // Dynamic Client Registration endpoint
+        if (req.method === 'POST' && urlPath === '/register') {
+            const body = await parseBody(req);
+            const client_name = body?.client_name ? String(body.client_name) : undefined;
+            const redirect_uris_raw = body?.redirect_uris;
+            const redirect_uris = Array.isArray(redirect_uris_raw)
+                ? redirect_uris_raw.map((u: any) => String(u))
+                : [];
+            const client_id = crypto.randomBytes(16).toString('hex');
+            registeredClients.set(client_id, {
+                client_id,
+                client_name,
+                redirect_uris,
+                createdAt: Date.now()
+            });
+            json(res, 201, {
+                client_id,
+                token_endpoint_auth_method: 'none',
+                redirect_uris
+            });
             return;
         }
 

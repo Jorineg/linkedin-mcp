@@ -330,7 +330,9 @@ def get_profile(publicIdentifier: str) -> Dict[str, Any]:
 try:
     # Use FastMCP's built-in ASGI app (per ASGI integration guide)
     # Endpoint defaults to /mcp/; adjust path if needed
-    app = mcp.http_app()
+    # Enable stateless mode for serverless platforms (e.g., Vercel) where lifespan events
+    # may not run, avoiding the need for a background task group
+    app = mcp.http_app(stateless_http=True)
 except Exception:  # pragma: no cover
     app = None  # type: ignore
 

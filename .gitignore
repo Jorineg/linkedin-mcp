@@ -5,3 +5,4 @@ sessions.json
 cookie_converter.js
 cookie.txt
 token.txt
+__pycache__

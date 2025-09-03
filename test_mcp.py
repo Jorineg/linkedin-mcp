@@ -1,6 +1,7 @@
 import os
 import asyncio
 from pathlib import Path
+import json
 
 from dotenv import load_dotenv
 from fastmcp import Client
@@ -45,19 +46,52 @@ async def main() -> None:
         tools = await client.list_tools()
         print("Tools:", tools)
 
-        # Optionally call get_profile if LI_PUBLIC_ID is set
-        public_identifier = os.environ.get("LI_PUBLIC_ID")
-        if not public_identifier:
-            print("LI_PUBLIC_ID not set; skipping get_profile test")
+        # Helper to parse MCP tool result content (single text item with JSON-encoded string)
+        def parse_text_content_json(tool_result: any) -> any:
+            if isinstance(tool_result, dict):
+                candidate = tool_result.get("content")
+                if candidate is None and isinstance(tool_result.get("result"), dict):
+                    candidate = tool_result["result"].get("content")
+                if isinstance(candidate, list) and candidate:
+                    first = candidate[0]
+                    if isinstance(first, dict) and first.get("type") == "text":
+                        text = first.get("text", "")
+                        try:
+                            return json.loads(text)
+                        except Exception:
+                            return None
+            if isinstance(tool_result, str):
+                try:
+                    return json.loads(tool_result)
+                except Exception:
+                    return None
+            return None
+
+        # Perform a search using LI_SEARCH_NAME
+        search_query = os.environ.get("LI_SEARCH_NAME")
+        if not search_query:
+            print("LI_SEARCH_NAME not set; skipping search+fetch test")
             return
 
-        result = await client.call_tool(
-            "get_profile",
-            {"publicIdentifier": public_identifier},
-        )
-        # Print raw result; representation depends on server/tool implementation
-        print("Profile:")
-        print(result)
+        search_result = await client.call_tool("search", {"query": search_query})
+        search_payload = parse_text_content_json(search_result) or {}
+        results = search_payload.get("results") or []
+        if not results:
+            print("No search results for:", search_query)
+            return
+        first = results[0] or {}
+        first_id = first.get("id")
+        if not first_id:
+            print("First search result missing 'id'; aborting")
+            return
+        print("First search result:")
+        print(json.dumps(first, ensure_ascii=False, indent=2))
+
+        # Fetch by id and print profile document
+        fetch_result = await client.call_tool("fetch", {"id": first_id})
+        fetch_doc = parse_text_content_json(fetch_result) or {}
+        print("\nFetched profile document:")
+        print(json.dumps(fetch_doc, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

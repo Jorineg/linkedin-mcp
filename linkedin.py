@@ -87,9 +87,63 @@ def _linkedin_headers(cookies: List[Dict[str, Any]], referer: str) -> Dict[str, 
     return headers
 
 
+def _get_cookies_from_env() -> List[Dict[str, Any]]:
+    """
+    Build minimal cookie set from environment. Only li_at is required.
+    """
+    li_at = os.getenv("LI_AT", "").strip()
+    if not li_at:
+        raise ValueError("Missing LI_AT in environment (.env)")
+    cookies: List[Dict[str, Any]] = [{"name": "li_at", "value": li_at}]
+    js_from_env = os.getenv("LI_JSESSIONID", "").strip()
+    if js_from_env:
+        cookies.append({"name": "JSESSIONID", "value": js_from_env})
+    return cookies
+
+
+def _cookiejar_to_list(jar: requests.cookies.RequestsCookieJar) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for c in jar:
+        out.append({"name": c.name, "value": c.value})
+    return out
+
+
 def _manual_get(path: str, referer: str, cookies: List[Dict[str, Any]]) -> Any:
-    headers = _linkedin_headers(cookies, referer)
-    resp = requests.get(
+    # Use a session to allow bootstrap of JSESSIONID (for CSRF token) if missing
+    session = requests.Session()
+    # Seed cookies provided (likely li_at, optionally JSESSIONID)
+    for c in cookies:
+        name = str(c.get("name", "")).strip()
+        if not name:
+            continue
+        value = str(c.get("value", ""))
+        # Set for linkedin.com domain to ensure it is sent
+        session.cookies.set(name, value, domain=".linkedin.com")
+
+    # If JSESSIONID missing, try a lightweight bootstrap call to establish it
+    has_js = any(str(c.get("name", "")).upper() == "JSESSIONID" for c in cookies)
+    if not has_js:
+        try:
+            session.get(
+                "https://www.linkedin.com/feed/",
+                headers={
+                    "user-agent": os.getenv(
+                        "LI_UA",
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+                    )
+                },
+                timeout=15,
+                allow_redirects=True,
+            )
+        except Exception:
+            # ignore bootstrap errors; proceed and let main request surface the issue
+            pass
+
+    # Build headers from current session cookies (which may now include JSESSIONID)
+    cookies_now = _cookiejar_to_list(session.cookies)
+    headers = _linkedin_headers(_normalize_cookies(cookies_now), referer)
+
+    resp = session.get(
         f"https://www.linkedin.com{path}", headers=headers, allow_redirects=False, timeout=20
     )
     if resp.status_code == 302:
@@ -265,27 +319,8 @@ def _parse_voyager_profile(raw: Any) -> Dict[str, Any]:
     }
 
 
-def _get_session_from_header(header_value: Optional[str]) -> List[Dict[str, Any]]:
-    if not header_value:
-        raise ValueError("Missing 'linkedin_session' header")
-    decoded = _b64_to_str(header_value.strip())
-    parsed = _try_parse_json(decoded or "") if decoded else None
-    if not parsed:
-        parsed = _try_parse_json(header_value)
-    if not parsed:
-        raise ValueError("linkedin_session must be base64(JSON) or JSON")
-    if isinstance(parsed, dict) and "cookies" in parsed:
-        cookies_raw = parsed.get("cookies")
-    else:
-        cookies_raw = parsed
-    cookies = _normalize_cookies(cookies_raw)
-    if not cookies:
-        raise ValueError("No cookies provided in linkedin_session")
-    return cookies
-
-
-def fetch_and_parse_profile(public_identifier: str, session_header: str) -> Dict[str, Any]:
-    cookies = _get_session_from_header(session_header)
+def fetch_and_parse_profile(public_identifier: str) -> Dict[str, Any]:
+    cookies = _get_cookies_from_env()
     raw = _manual_get_profile_raw(cookies, public_identifier)
     return _parse_voyager_profile(raw)
 

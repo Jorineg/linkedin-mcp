@@ -7,7 +7,6 @@ from dotenv import load_dotenv
 
 # FastMCP 2.0 API
 from fastmcp import FastMCP
-from fastmcp.server.dependencies import get_http_headers
 from linkedin import fetch_and_parse_profile
 
 
@@ -16,31 +15,13 @@ from linkedin import fetch_and_parse_profile
 load_dotenv()
 mcp = FastMCP("LinkedIn MCP: Profile Only")
 
-
-@mcp.tool
 def get_profile(publicIdentifier: str) -> Dict[str, Any]:
     """
     Fetch a LinkedIn profile by publicIdentifier and return summary, experience, education, and skills.
     Public identifier is the part of the profile URL after /in/
     """
-    headers = {}
-    try:
-        headers = get_http_headers() or {}
-    except Exception:
-        headers = {}
-
-    session_header = None
-    # normalize header names to lowercase keys
-    for k, v in list(headers.items()):
-        if isinstance(k, str) and k.lower() == "linkedin_session":
-            session_header = v
-            break
-
-    if not session_header:
-        raise ValueError("Missing 'linkedin_session' header")
-
-    # brief throttle removed; FastMCP will manage concurrency; LinkedIn rate-limit still possible client-side
-    return fetch_and_parse_profile(publicIdentifier, str(session_header))
+    # No header-based auth; read LI_AT from environment inside linkedin.py
+    return fetch_and_parse_profile(publicIdentifier)
 
 
 def _extract_linkedin_public_identifier(url: str) -> Optional[str]:
@@ -99,7 +80,7 @@ def _as_text_content(payload: Any) -> Dict[str, Any]:
 
 
 @mcp.tool
-def search(query: str) -> Dict[str, Any]:
+def search(query: str) -> Dict[str, List[Dict[str, Any]]]:
     """
     Search for relevant LinkedIn profiles for a free-text query.
 
@@ -123,6 +104,9 @@ def search(query: str) -> Dict[str, Any]:
                 "rank": item.get("rank"),
             }
         )
+
+    print("rows:", rows)
+    print("Results:", results)
     return _as_text_content({"results": results})
 
 
@@ -139,22 +123,8 @@ def fetch(id: str) -> Dict[str, Any]:
       { "id", "title", "text", "url", "metadata" }. The "text" field is a JSON string
       of the raw profile data.
     """
-    # Acquire session header (same logic as get_profile)
-    headers = {}
-    try:
-        headers = get_http_headers() or {}
-    except Exception:
-        headers = {}
-
-    session_header = None
-    for k, v in list(headers.items()):
-        if isinstance(k, str) and k.lower() == "linkedin_session":
-            session_header = v
-            break
-    if not session_header:
-        raise ValueError("Missing 'linkedin_session' header")
-
-    profile = fetch_and_parse_profile(id, str(session_header))
+    # Use LI_AT from environment; no headers required
+    profile = fetch_and_parse_profile(id)
     full_name = str(profile.get("fullName") or id).strip()
     headline = profile.get("headline") or ""
     location = profile.get("location") or ""
@@ -177,7 +147,6 @@ def fetch(id: str) -> Dict[str, Any]:
     }
     return _as_text_content(doc)
 
-@mcp.tool
 def search_linkedin_profiles(query: str, country: str = "us", results: int = 10, page: int = 0) -> List[Dict[str, Any]]:
     """
     LinkedIn-only search tool. Uses Google via Scrapingdog but ALWAYS restricts to LinkedIn profile URLs.
@@ -214,7 +183,14 @@ def search_linkedin_profiles(query: str, country: str = "us", results: int = 10,
         raise RuntimeError(f"Scrapingdog error: HTTP {resp.status_code} - {resp.text[:300]}")
 
     payload = resp.json()
-    organic = payload.get("organic_data") or []
+    print("payload:", payload)
+    # Scrapingdog may return either 'organic_results' or 'organic_data'
+    organic = (
+        payload.get("organic_results")
+        or payload.get("organic_data")
+        or payload.get("organic")
+        or []
+    )
 
     results_out: List[Dict[str, Any]] = []
     for item in organic:
